@@ -1,112 +1,81 @@
 import express from "express";
 import cors from "cors";
+import bodyParser from "body-parser";
 import fileUpload from "express-fileupload";
 import rateLimit from "express-rate-limit";
-import helmet from "helmet";
+import { v4 as uuidv4 } from "uuid";
+import gtts from "google-tts-api";
 import fs from "fs";
 import path from "path";
-import { exec } from "child_process";
-import { v4 as uuidv4 } from "uuid";
-import gTTS from "gtts";
 
 const app = express();
-app.use(helmet());
-app.use(cors());
-app.use(express.json());
-app.use(fileUpload({ limits: { fileSize: 300 * 1024 * 1024 } })); // 300MB
+const PORT = process.env.PORT || 10000;
 
-const apiLimiter = rateLimit({
-  windowMs: 60 * 1000, // 1 minute
-  max: 30,
-  message: { error: "Too many requests, slow down." }
+// إعدادات الأمان والحد من الطلبات
+const limiter = rateLimit({
+  windowMs: 60 * 1000, // دقيقة واحدة
+  max: 100, // أقصى عدد طلبات في الدقيقة
 });
-app.use("/api/", apiLimiter);
+app.use(limiter);
 
-const PUBLIC = path.join(process.cwd(), "public");
-if (!fs.existsSync(PUBLIC)) fs.mkdirSync(PUBLIC);
-app.use("/public", express.static(PUBLIC));
+// إعدادات عامة
+app.use(cors());
+app.use(bodyParser.json());
+app.use(fileUpload());
+app.use(express.static("public"));
 
-const BACKEND_TOKEN = process.env.BACKEND_TOKEN || "";
+// ✅ نقطة اختبار (لتتأكد أن السيرفر يعمل)
+app.get("/", (req, res) => {
+  res.send("✅ Convertly Backend is running!");
+});
 
-// health
-app.get("/", (req, res) => res.send("Convertly backend running"));
 
-// token middleware
-function requireToken(req, res, next) {
-  if (!BACKEND_TOKEN) return next();
-  const t = req.headers["x-backend-token"] || req.query.token;
-  if (t && t === BACKEND_TOKEN) return next();
-  return res.status(401).json({ error: "Unauthorized - missing token" });
-}
-
-// TTS - returns /public/tts-xxx.mp3
-app.post("/api/text-to-speech", requireToken, (req, res) => {
+// ===============================
+// 🔊 تحويل النص إلى صوت (TTS)
+// ===============================
+app.post("/api/text-to-speech", async (req, res) => {
   try {
     const { text, lang } = req.body;
-    if (!text) return res.status(400).json({ error: "No text provided" });
-    const id = uuidv4();
-    const fname = `tts-${id}.mp3`;
-    const fpath = path.join(PUBLIC, fname);
-    const tts = new gTTS(text, lang || "en");
-    tts.save(fpath, (err) => {
-      if (err) {
-        console.error("gTTS error:", err);
-        return res.status(500).json({ error: "TTS generation failed" });
-      }
-      return res.json({ url: `/public/${fname}` });
+    if (!text) return res.status(400).json({ error: "Text is required" });
+
+    const url = gtts.getAudioUrl(text, {
+      lang: lang || "en",
+      slow: false,
+      host: "https://translate.google.com",
     });
-  } catch (e) {
-    console.error(e);
-    res.status(500).json({ error: "Server error" });
+
+    res.json({ audioUrl: url });
+  } catch (error) {
+    console.error(error);
+    res.status(500).json({ error: "TTS conversion failed" });
   }
 });
 
-// Video upload -> MP3 using ffmpeg (server must have ffmpeg)
-app.post("/api/video-to-audio", requireToken, async (req, res) => {
+
+// ===============================
+// 🖼️ تحويل الصور إلى PDF مثال بسيط
+// ===============================
+app.post("/api/image-to-pdf", async (req, res) => {
   try {
-    if (!req.files || !req.files.video) return res.status(400).json({ error: "No file uploaded" });
-    const vid = req.files.video;
-    const id = uuidv4();
-    const inPath = path.join(PUBLIC, `${id}-${vid.name}`);
-    const outPath = path.join(PUBLIC, `${id}.mp3`);
-    await vid.mv(inPath);
-    const cmd = `ffmpeg -y -i "${inPath}" -vn -ar 44100 -ac 2 -b:a 192k "${outPath}"`;
-    exec(cmd, { maxBuffer: 1024 * 1024 * 500 }, (err, stdout, stderr) => {
-      try { fs.unlinkSync(inPath); } catch (_) {}
-      if (err) {
-        console.error("ffmpeg error:", err, stderr);
-        return res.status(500).json({ error: "Conversion failed" });
-      }
-      return res.json({ url: `/public/${path.basename(outPath)}` });
-    });
-  } catch (e) {
-    console.error(e);
-    res.status(500).json({ error: "Server error" });
+    if (!req.files || !req.files.image)
+      return res.status(400).json({ error: "No image uploaded" });
+
+    const file = req.files.image;
+    const fileName = `${uuidv4()}.png`;
+    const filePath = path.join("/tmp", fileName);
+    await file.mv(filePath);
+
+    // ⚠️ هنا فقط مثال - يمكنك لاحقًا دمج مكتبة لتحويل PNG إلى PDF فعلي
+    res.json({ message: "Image uploaded successfully", path: filePath });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: "Image conversion failed" });
   }
 });
 
-// Downloader (yt-dlp must be installed on server)
-app.post("/api/download", requireToken, (req, res) => {
-  try {
-    const { url } = req.body;
-    if (!url) return res.status(400).json({ error: "No url provided" });
-    const id = uuidv4();
-    const outTemplate = path.join(PUBLIC, `${id}-%(title).%(ext)s`);
-    const cmd = `yt-dlp -f "bestvideo[ext=mp4]+bestaudio/best" -o "${outTemplate}" "${url}"`;
-    exec(cmd, { maxBuffer: 1024 * 1024 * 500 }, (err, stdout, stderr) => {
-      if (err) {
-        console.error("yt-dlp error:", err, stderr);
-        return res.status(500).json({ error: "Download failed" });
-      }
-      const files = fs.readdirSync(PUBLIC).filter(f => f.startsWith(id + "-"));
-      if (files.length === 0) return res.status(500).json({ error: "No file produced" });
-      return res.json({ download: `/public/${files[0]}` });
-    });
-  } catch (e) {
-    console.error(e);
-    res.status(500).json({ error: "Server error" });
-  }
+// ===============================
+// 🚀 تشغيل السيرفر
+// ===============================
+app.listen(PORT, () => {
+  console.log(`🚀 Server running on port ${PORT}`);
 });
-
-const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => console.log(`Convertly backend running on ${PORT}`));
