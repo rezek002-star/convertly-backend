@@ -1,81 +1,71 @@
 import express from "express";
-import cors from "cors";
-import bodyParser from "body-parser";
 import fileUpload from "express-fileupload";
-import rateLimit from "express-rate-limit";
+import cors from "cors";
 import { v4 as uuidv4 } from "uuid";
-import gtts from "google-tts-api";
 import fs from "fs";
 import path from "path";
+import { fileURLToPath } from "url";
+import sharp from "sharp";
+import { PDFDocument } from "pdf-lib";
+import mammoth from "mammoth";
+import AdmZip from "adm-zip";
+import googleTTS from "google-tts-api";
+
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = path.dirname(__filename);
 
 const app = express();
+app.use(cors());
+app.use(fileUpload());
+app.use(express.json());
+
 const PORT = process.env.PORT || 10000;
 
-// إعدادات الأمان والحد من الطلبات
-const limiter = rateLimit({
-  windowMs: 60 * 1000, // دقيقة واحدة
-  max: 100, // أقصى عدد طلبات في الدقيقة
-});
-app.use(limiter);
-
-// إعدادات عامة
-app.use(cors());
-app.use(bodyParser.json());
-app.use(fileUpload());
-app.use(express.static("public"));
-
-// ✅ نقطة اختبار (لتتأكد أن السيرفر يعمل)
-app.get("/", (req, res) => {
-  res.send("✅ Convertly Backend is running!");
+// 📘 تحويل الصور إلى PNG/JPG
+app.post("/convert/image", async (req, res) => {
+  if (!req.files?.file) return res.status(400).send("No file uploaded");
+  const file = req.files.file;
+  const ext = req.body.format || "png";
+  const output = `${__dirname}/tmp/${uuidv4()}.${ext}`;
+  await sharp(file.data).toFile(output);
+  res.download(output, () => fs.unlinkSync(output));
 });
 
-
-// ===============================
-// 🔊 تحويل النص إلى صوت (TTS)
-// ===============================
-app.post("/api/text-to-speech", async (req, res) => {
-  try {
-    const { text, lang } = req.body;
-    if (!text) return res.status(400).json({ error: "Text is required" });
-
-    const url = gtts.getAudioUrl(text, {
-      lang: lang || "en",
-      slow: false,
-      host: "https://translate.google.com",
-    });
-
-    res.json({ audioUrl: url });
-  } catch (error) {
-    console.error(error);
-    res.status(500).json({ error: "TTS conversion failed" });
-  }
+// 📙 تحويل DOCX إلى PDF
+app.post("/convert/pdf", async (req, res) => {
+  if (!req.files?.file) return res.status(400).send("No file uploaded");
+  const file = req.files.file;
+  const html = (await mammoth.convertToHtml({ buffer: file.data })).value;
+  const pdfDoc = await PDFDocument.create();
+  pdfDoc.addPage().drawText(html.replace(/<[^>]+>/g, ""), { x: 50, y: 700 });
+  const pdfBytes = await pdfDoc.save();
+  const output = `${__dirname}/tmp/${uuidv4()}.pdf`;
+  fs.writeFileSync(output, pdfBytes);
+  res.download(output, () => fs.unlinkSync(output));
 });
 
-
-// ===============================
-// 🖼️ تحويل الصور إلى PDF مثال بسيط
-// ===============================
-app.post("/api/image-to-pdf", async (req, res) => {
-  try {
-    if (!req.files || !req.files.image)
-      return res.status(400).json({ error: "No image uploaded" });
-
-    const file = req.files.image;
-    const fileName = `${uuidv4()}.png`;
-    const filePath = path.join("/tmp", fileName);
-    await file.mv(filePath);
-
-    // ⚠️ هنا فقط مثال - يمكنك لاحقًا دمج مكتبة لتحويل PNG إلى PDF فعلي
-    res.json({ message: "Image uploaded successfully", path: filePath });
-  } catch (err) {
-    console.error(err);
-    res.status(500).json({ error: "Image conversion failed" });
-  }
+// 🎧 تحويل نص إلى صوت
+app.post("/convert/tts", async (req, res) => {
+  const text = req.body.text;
+  if (!text) return res.status(400).send("Missing text");
+  const url = googleTTS.getAudioUrl(text, { lang: "en", slow: false });
+  res.json({ audioUrl: url });
 });
 
-// ===============================
-// 🚀 تشغيل السيرفر
-// ===============================
-app.listen(PORT, () => {
-  console.log(`🚀 Server running on port ${PORT}`);
+// 📂 ضغط الملفات إلى ZIP
+app.post("/convert/zip", async (req, res) => {
+  if (!req.files) return res.status(400).send("No files uploaded");
+  const zip = new AdmZip();
+  Object.values(req.files).forEach((f) => zip.addFile(f.name, f.data));
+  const output = `${__dirname}/tmp/${uuidv4()}.zip`;
+  zip.writeZip(output);
+  res.download(output, () => fs.unlinkSync(output));
 });
+
+app.get("/", (req, res) => res.send("✅ Convertly Backend is running!"));
+
+// إنشاء مجلد مؤقت إن لم يكن موجودًا
+if (!fs.existsSync(path.join(__dirname, "tmp")))
+  fs.mkdirSync(path.join(__dirname, "tmp"));
+
+app.listen(PORT, () => console.log(`🚀 Server running on port ${PORT}`));
